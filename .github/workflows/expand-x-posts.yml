@@ -1,0 +1,50 @@
+name: Expand X posts
+
+# issue に X (Twitter) のポストURLをコメントしたら、ポスト本文とリンク先URLを
+# oEmbed で取得して返信コメントとして残す。
+# 実行のたびに、その issue の未処理コメントをすべて処理する（連続投稿で実行が
+# 取り消されても取りこぼさないため）。既存の issue をまとめて処理したいときは
+# Actions タブから手動実行する。
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "対象の issue 番号（空ならオープン中の issue すべて）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: expand-x-posts-${{ github.event.issue.number || inputs.issue_number || 'open' }}
+  cancel-in-progress: false
+
+jobs:
+  expand:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.issue.pull_request == null &&
+        github.event.comment.author_association == 'OWNER' &&
+        github.event.comment.user.type != 'Bot' &&
+        (contains(github.event.comment.body, 'x.com/') || contains(github.event.comment.body, 'twitter.com/'))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Expand X posts
+        run: node .github/scripts/expand-x-posts.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
