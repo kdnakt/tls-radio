@@ -2,11 +2,16 @@
 // 本文とリンク先URLを oEmbed で取得し、返信コメントとして書き込む。
 // 依存パッケージなし（Node.js 20+ の fetch を使用）。
 
+import { pathToFileURL } from "node:url";
+
 const MARKER_PREFIX = "<!-- x-post-expander source-comment:";
 const MARKER_RE = /<!-- x-post-expander source-comment:(\d+) -->/g;
+// ユーザー名部分は、アプリの共有リンク（x.com/i/web/status/ID）の "i/web" も許容する
 const STATUS_URL_RE =
-  /https?:\/\/(?:www\.|mobile\.)?(?:x|twitter)\.com\/([A-Za-z0-9_]{1,15})\/status(?:es)?\/(\d+)[^\s<>()\[\]]*/g;
+  /https?:\/\/(?:www\.|mobile\.)?(?:x|twitter)\.com\/(?:i\/web|([A-Za-z0-9_]{1,15}))\/status(?:es)?\/(\d+)[^\s<>()\[\]]*/g;
 const TCO_RE = /^https?:\/\/t\.co\//;
+const URL_RE = /https?:\/\/[^\s<>()\[\]]+/g;
+const FETCH_TIMEOUT_MS = 10_000;
 
 // ---------- 純粋関数（テスト対象） ----------
 
@@ -14,9 +19,10 @@ const TCO_RE = /^https?:\/\/t\.co\//;
 export function extractStatusUrls(text) {
   const seen = new Map();
   for (const m of (text ?? "").matchAll(STATUS_URL_RE)) {
-    const [original, user, id] = m;
+    const user = m[1] ?? "i";
+    const id = m[2];
     if (!seen.has(id)) {
-      seen.set(id, { id, user, original, canonical: `https://x.com/${user}/status/${id}` });
+      seen.set(id, { id, user, canonical: `https://x.com/${user}/status/${id}` });
     }
   }
   return [...seen.values()];
@@ -28,7 +34,8 @@ export function decodeEntities(s) {
   return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (all, e) => {
     if (e[0] === "#") {
       const cp = e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
-      return Number.isFinite(cp) ? String.fromCodePoint(cp) : all;
+      const valid = Number.isFinite(cp) && cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff);
+      return valid ? String.fromCodePoint(cp) : all;
     }
     return NAMED_ENTITIES[e.toLowerCase()] ?? all;
   });
@@ -61,12 +68,21 @@ export function parseOEmbedHtml(html) {
   return { text, links, date };
 }
 
-/** GitHub の @メンション と issue 参照で通知・相互参照が飛ばないようにする */
+/**
+ * GitHub の @メンション と issue 参照で通知・相互参照が飛ばないようにする。
+ * URL の中（例: medium.com/@user や ...js#L10）は書き換えない。
+ */
 export function neutralize(s) {
+  const urls = s.match(URL_RE) ?? [];
   return s
-    .replace(/@(?=[A-Za-z0-9_-])/g, "@​")
-    .replace(/(^|[^&\w])#(?=\d)/g, "$1#​")
-    .replace(/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#/g, "$1​#");
+    .split(URL_RE)
+    .map((seg) =>
+      seg
+        .replace(/@(?=[A-Za-z0-9_-])/g, "@\u200b")
+        .replace(/(^|[^&\w])#(?=\d)/g, "$1#\u200b")
+        .replace(/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#/g, "$1\u200b#")
+    )
+    .reduce((out, seg, i) => out + urls[i - 1] + seg);
 }
 
 function quote(s) {
@@ -122,10 +138,14 @@ export function shouldProcess(comment, doneIds) {
 
 const UA = "Mozilla/5.0 (compatible; tls-radio-x-post-expander; +https://github.com/kdnakt/tls-radio)";
 
+function fetchOpts(extra = {}) {
+  return { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS), headers: { "User-Agent": UA }, ...extra };
+}
+
 export async function expandTco(url, fetchImpl = fetch) {
   if (!TCO_RE.test(url)) return url;
   try {
-    const res = await fetchImpl(url, { redirect: "manual", headers: { "User-Agent": UA } });
+    const res = await fetchImpl(url, fetchOpts({ redirect: "manual" }));
     const loc = res.headers.get("location");
     if (loc) return loc;
     const body = await res.text();
@@ -139,20 +159,31 @@ export async function expandTco(url, fetchImpl = fetch) {
   return url;
 }
 
+/**
+ * ポストを oEmbed で取得する。
+ * 失敗時の `retryable` は、時間をおけば取れる可能性がある失敗（通信エラー・429・5xx など）。
+ * retryable な失敗は返信に書かず、次回の実行で再試行する。
+ */
 export async function fetchPost(post, fetchImpl = fetch) {
   const target = `https://twitter.com/${post.user}/status/${post.id}`;
   const api = `https://publish.twitter.com/oembed?omit_script=true&dnt=true&lang=ja&url=${encodeURIComponent(target)}`;
   let res;
   try {
-    res = await fetchImpl(api, { headers: { "User-Agent": UA } });
+    res = await fetchImpl(api, fetchOpts());
   } catch (e) {
-    return { ok: false, post, error: `通信エラー: ${e.message}` };
+    return { ok: false, retryable: true, post, error: `通信エラー: ${e.message}` };
   }
   if (!res.ok) {
+    const retryable = res.status === 429 || res.status >= 500;
     const hint = res.status === 404 ? ": 削除・非公開・鍵アカウントの可能性" : "";
-    return { ok: false, post, error: `HTTP ${res.status}${hint}` };
+    return { ok: false, retryable, post, error: `HTTP ${res.status}${hint}` };
   }
-  const data = await res.json();
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    return { ok: false, retryable: true, post, error: `応答の解析に失敗: ${e.message}` };
+  }
   const parsed = parseOEmbedHtml(data.html ?? "");
   const handle = (data.author_url ?? "").split("/").filter(Boolean).pop() ?? post.user;
   const links = [];
@@ -205,23 +236,41 @@ async function listAll(api, path) {
   }
 }
 
-export async function processIssue({ api, repo, issueNumber, onlyCommentId, fetchImpl = fetch, log = console.log }) {
-  const comments = await listAll(api, `/repos/${repo}/issues/${issueNumber}/comments`);
+/**
+ * issue の未処理コメントをすべて処理する。
+ * 戻り値: { replied: 返信した件数, deferred: 一時的な失敗で見送った件数 }
+ */
+export async function processIssue({ api, repo, issueNumber, fetchImpl = fetch, log = console.log }) {
+  const path = `/repos/${repo}/issues/${issueNumber}/comments`;
+  const comments = await listAll(api, path);
   const done = existingSourceIds(comments);
-  const targets = comments.filter(
-    (c) => (onlyCommentId ? String(c.id) === String(onlyCommentId) : true) && shouldProcess(c, done)
-  );
+  const targets = comments.filter((c) => shouldProcess(c, done));
   log(`#${issueNumber}: コメント${comments.length}件中、処理対象${targets.length}件`);
+  let replied = 0;
+  let deferred = 0;
   for (const c of targets) {
     const results = [];
     for (const post of extractStatusUrls(c.body)) {
       results.push(await fetchPost(post, fetchImpl));
     }
-    await api("POST", `/repos/${repo}/issues/${issueNumber}/comments`, { body: buildReply(c, results) });
+    const transient = results.filter((r) => !r.ok && r.retryable);
+    if (transient.length) {
+      // マーカー付きの返信を書くと二度と再処理されないので、今回は見送る
+      deferred++;
+      log(`  comment ${c.id}: 一時的なエラーのため見送り（次回再試行）: ${transient.map((r) => r.error).join(" / ")}`);
+      continue;
+    }
+    // 別の実行（手動の全件処理など）が先に返信していないか、投稿直前にもう一度確認する
+    if (existingSourceIds(await listAll(api, path)).has(String(c.id))) {
+      log(`  comment ${c.id}: 別の実行が返信済みのためスキップ`);
+      continue;
+    }
+    await api("POST", path, { body: buildReply(c, results) });
+    replied++;
     const ng = results.filter((r) => !r.ok).length;
     log(`  comment ${c.id}: ポスト${results.length}件（取得失敗${ng}件）を返信しました`);
   }
-  return targets.length;
+  return { replied, deferred };
 }
 
 async function main() {
@@ -230,18 +279,21 @@ async function main() {
   if (!token || !repo) throw new Error("GITHUB_TOKEN と GITHUB_REPOSITORY が必要です");
   const api = gh(token);
   const issueNumber = (process.env.ISSUE_NUMBER ?? "").trim();
-  const commentId = (process.env.COMMENT_ID ?? "").trim();
 
+  let deferred = 0;
   if (issueNumber) {
-    await processIssue({ api, repo, issueNumber, onlyCommentId: commentId || undefined });
-    return;
+    deferred += (await processIssue({ api, repo, issueNumber })).deferred;
+  } else {
+    // 手動実行で issue 番号の指定がなければ、オープン中の issue をすべて処理する
+    const issues = (await listAll(api, `/repos/${repo}/issues?state=open`)).filter((i) => !i.pull_request);
+    for (const i of issues) deferred += (await processIssue({ api, repo, issueNumber: i.number })).deferred;
   }
-  // 手動実行で issue 番号の指定がなければ、オープン中の issue をすべて処理する
-  const issues = (await listAll(api, `/repos/${repo}/issues?state=open`)).filter((i) => !i.pull_request);
-  for (const i of issues) await processIssue({ api, repo, issueNumber: i.number });
+  if (deferred) {
+    throw new Error(`一時的なエラーで${deferred}件のコメントを見送りました。時間をおいて手動実行してください`);
+  }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   main().catch((e) => {
     console.error(e);
     process.exit(1);

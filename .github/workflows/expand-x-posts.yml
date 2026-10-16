@@ -2,7 +2,9 @@ name: Expand X posts
 
 # issue に X (Twitter) のポストURLをコメントしたら、ポスト本文とリンク先URLを
 # oEmbed で取得して返信コメントとして残す。
-# 既存の issue をまとめて処理したいときは Actions タブから手動実行する。
+# 実行のたびに、その issue の未処理コメントをすべて処理する（連続投稿で実行が
+# 取り消されても取りこぼさないため）。既存の issue をまとめて処理したいときは
+# Actions タブから手動実行する。
 
 on:
   issue_comment:
@@ -46,4 +48,3 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
-          COMMENT_ID: ${{ github.event.comment.id }}
