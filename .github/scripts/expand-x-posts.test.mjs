@@ -103,6 +103,51 @@ test("fetchPost: 成功", async () => {
   ]);
 });
 
+const QUOTING_HTML = (href) =>
+  `<blockquote class="twitter-tweet"><p lang="pl" dir="ltr">Wiesz? <a href="${href}">${href}</a></p>&mdash; Bob (@bob) <a href="https://twitter.com/bob/status/444">November 19, 2026</a></blockquote>`;
+const bobPost = { id: "444", user: "bob", canonical: "https://x.com/bob/status/444" };
+
+test("fetchPost: 引用ポストを1段だけ取得する（直リンクと t.co 経由）", async () => {
+  const f = mockFetch({
+    [OEMBED_API("bob", "444")]: { status: 200, json: { html: QUOTING_HTML("https://t.co/q"), author_name: "Bob", author_url: "https://twitter.com/bob" } },
+    "https://t.co/q": { status: 301, headers: { location: "https://twitter.com/carol/status/555" } },
+    [OEMBED_API("carol", "555")]: { status: 200, json: { html: `<p>PHP <a href="https://t.co/z">https://t.co/z</a></p>`, author_name: "Carol", author_url: "https://twitter.com/carol" } },
+    "https://t.co/z": { status: 301, headers: { location: "https://twitter.com/dave/status/666" } },
+  });
+  const r = await fetchPost(bobPost, f);
+  assert.equal(r.ok, true);
+  assert.equal(r.quoted.length, 1);
+  assert.equal(r.quoted[0].author, "Carol (@carol)");
+  assert.equal(r.quoted[0].text, "PHP https://twitter.com/dave/status/666");
+  assert.deepEqual(r.quoted[0].quoted, [], "引用の引用は辿らない");
+  assert.equal(r.links[0].quoted, true);
+  assert.equal(f.calls.some((c) => c.url === OEMBED_API("dave", "666")), false);
+});
+
+test("fetchPost: 画像リンク・自分自身へのリンクは引用扱いにしない", async () => {
+  const f = mockFetch({
+    [OEMBED_API("alice", "111")]: { status: 200, json: { html: `<p><a href="https://t.co/pic">pic.twitter.com/pic</a> <a href="https://t.co/self">https://t.co/self</a></p>`, author_name: "Alice", author_url: "https://twitter.com/alice" } },
+    "https://t.co/pic": { status: 301, headers: { location: "https://twitter.com/alice/status/111/photo/1" } },
+    "https://t.co/self": { status: 301, headers: { location: "https://twitter.com/alice/status/111" } },
+  });
+  const r = await fetchPost(post, f);
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.quoted, []);
+  assert.equal(f.calls.filter((c) => c.url.startsWith("https://publish.twitter.com/")).length, 1);
+});
+
+test("fetchPost: 引用ポストの失敗（404 は注記、429 は親ごと見送り）", async () => {
+  const quoting = { status: 200, json: { html: QUOTING_HTML("https://twitter.com/carol/status/555") } };
+  const gone = await fetchPost(bobPost, mockFetch({ [OEMBED_API("bob", "444")]: quoting, [OEMBED_API("carol", "555")]: { status: 404 } }));
+  assert.equal(gone.ok, true);
+  assert.equal(gone.quoted[0].ok, false);
+  assert.match(gone.quoted[0].error, /HTTP 404/);
+  const busy = await fetchPost(bobPost, mockFetch({ [OEMBED_API("bob", "444")]: quoting, [OEMBED_API("carol", "555")]: { status: 429 } }));
+  assert.equal(busy.ok, false);
+  assert.equal(busy.retryable, true);
+  assert.match(busy.error, /引用ポスト https:\/\/x\.com\/carol\/status\/555: HTTP 429/);
+});
+
 test("fetchPost: 失敗の分類", async () => {
   const cases = [
     [{ status: 404 }, false, /HTTP 404: 削除/],
@@ -145,6 +190,35 @@ test("buildReply", () => {
     "（画像・動画 1件）",
     "",
     "#### https://x.com/i/status/333",
+    "> 取得できませんでした（HTTP 404: 削除・非公開・鍵アカウントの可能性）",
+  ].join("\n"));
+});
+
+test("buildReply: 引用ポスト", () => {
+  const src = { id: 7, html_url: "https://github.com/kdnakt/tls-radio/issues/1#issuecomment-7" };
+  const body = buildReply(src, [
+    { ok: true, post: bobPost, author: "Bob (@bob)", date: "November 19, 2026", text: "Wiesz? https://twitter.com/carol/status/555",
+      links: [{ expanded: "https://twitter.com/carol/status/555", isMedia: false, quoted: true }],
+      quoted: [
+        { ok: true, post: { canonical: "https://x.com/carol/status/555" }, author: "Carol (@carol)", date: "", text: "PHP sent clear text", links: [], quoted: [] },
+        { ok: false, post: { canonical: "https://x.com/dave/status/666" }, error: "HTTP 404: 削除・非公開・鍵アカウントの可能性" },
+      ] },
+  ]);
+  assert.equal(body, [
+    "<!-- x-post-expander source-comment:7 -->",
+    "**Xポストの内容（自動取得）** — [元コメント](https://github.com/kdnakt/tls-radio/issues/1#issuecomment-7)",
+    "",
+    `#### Bob (@${ZW}bob) · November 19, 2026`,
+    "https://x.com/bob/status/444",
+    "",
+    "> Wiesz? https://twitter.com/carol/status/555",
+    "",
+    `##### 引用ポスト: Carol (@${ZW}carol)`,
+    "https://x.com/carol/status/555",
+    "",
+    "> PHP sent clear text",
+    "",
+    "##### 引用ポスト: https://x.com/dave/status/666",
     "> 取得できませんでした（HTTP 404: 削除・非公開・鍵アカウントの可能性）",
   ].join("\n"));
 });
