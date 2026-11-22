@@ -92,6 +92,27 @@ function quote(s) {
     .join("\n");
 }
 
+function renderPost(r, heading, parts) {
+  if (!r.ok) {
+    parts.push(`${heading} ${r.post.canonical}`, `> 取得できませんでした（${r.error}）`);
+    return;
+  }
+  const header = `${r.author}${r.date ? ` · ${r.date}` : ""}`;
+  parts.push(`${heading} ${neutralize(header)}`, r.post.canonical, "", quote(neutralize(r.text)));
+  const external = r.links.filter((l) => !l.isMedia && !l.quoted);
+  const media = r.links.filter((l) => l.isMedia);
+  if (external.length) {
+    parts.push("", "リンク先:");
+    for (const l of external) parts.push(`- ${l.expanded}`);
+  }
+  if (media.length) parts.push("", `（画像・動画 ${media.length}件）`);
+  // 引用ポスト（1段のみ）。引用元の本文はここで読めるので、Claude などが X を開けなくても拾える
+  for (const q of r.quoted ?? []) {
+    parts.push("");
+    renderPost(q, "##### 引用ポスト:", parts);
+  }
+}
+
 /** 返信コメントの本文を組み立てる */
 export function buildReply(sourceComment, results) {
   const parts = [
@@ -100,19 +121,7 @@ export function buildReply(sourceComment, results) {
   ];
   for (const r of results) {
     parts.push("");
-    if (!r.ok) {
-      parts.push(`#### ${r.post.canonical}`, `> 取得できませんでした（${r.error}）`);
-      continue;
-    }
-    const header = `${r.author}${r.date ? ` · ${r.date}` : ""}`;
-    parts.push(`#### ${neutralize(header)}`, r.post.canonical, "", quote(neutralize(r.text)));
-    const external = r.links.filter((l) => !l.isMedia);
-    const media = r.links.filter((l) => l.isMedia);
-    if (external.length) {
-      parts.push("", "リンク先:");
-      for (const l of external) parts.push(`- ${l.expanded}`);
-    }
-    if (media.length) parts.push("", `（画像・動画 ${media.length}件）`);
+    renderPost(r, "####", parts);
   }
   return parts.join("\n");
 }
@@ -163,8 +172,12 @@ export async function expandTco(url, fetchImpl = fetch) {
  * ポストを oEmbed で取得する。
  * 失敗時の `retryable` は、時間をおけば取れる可能性がある失敗（通信エラー・429・5xx など）。
  * retryable な失敗は返信に書かず、次回の実行で再試行する。
+ *
+ * 本文中の t.co を展開した先が別のポストなら、引用ポストとして `depth` 段まで取得する
+ * （既定は1段。引用の引用までは辿らない）。引用ポストの取得が一時的に失敗したときは、
+ * 親も retryable な失敗として扱い、引用が欠けた返信を残さない。
  */
-export async function fetchPost(post, fetchImpl = fetch) {
+export async function fetchPost(post, fetchImpl = fetch, depth = 1) {
   const target = `https://twitter.com/${post.user}/status/${post.id}`;
   const api = `https://publish.twitter.com/oembed?omit_script=true&dnt=true&lang=ja&url=${encodeURIComponent(target)}`;
   let res;
@@ -195,6 +208,22 @@ export async function fetchPost(post, fetchImpl = fetch) {
     links.push({ ...l, expanded, isMedia });
     text = text.split(l.url).join(isMedia ? "" : expanded);
   }
+  const quoted = [];
+  if (depth > 0) {
+    const seen = new Set([post.id]);
+    for (const l of links) {
+      if (l.isMedia) continue;
+      const [q] = extractStatusUrls(l.expanded);
+      if (!q || seen.has(q.id)) continue;
+      seen.add(q.id);
+      l.quoted = true;
+      const qr = await fetchPost(q, fetchImpl, depth - 1);
+      if (!qr.ok && qr.retryable) {
+        return { ok: false, retryable: true, post, error: `引用ポスト ${q.canonical}: ${qr.error}` };
+      }
+      quoted.push(qr);
+    }
+  }
   return {
     ok: true,
     post,
@@ -202,6 +231,7 @@ export async function fetchPost(post, fetchImpl = fetch) {
     date: parsed.date,
     text: text.replace(/[ \t]+\n/g, "\n").trim(),
     links,
+    quoted,
   };
 }
 
